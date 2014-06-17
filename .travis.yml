@@ -1,16 +1,8 @@
 language: ruby
 os: linux
-bundler_args: --without development --path=~/.bundle
 rvm:
-  - 1.8.7
-  - 1.9.2
-  - 1.9.3
   - 2.0.0
   - 2.1.2
-before_install:
-- 'echo ''gem: --no-ri --no-rdoc'' > ~/.gemrc'
-- gem install bundler bundle_cache
-- bundle_cache_install
 env:
   global:
   - CODECLIMATE_REPO_TOKEN=ce41872e2a5a6113de9ae79a83e48c01b53bd8aea3fb1b9cf93d18d1e82c4eb1
