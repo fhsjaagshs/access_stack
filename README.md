@@ -1,5 +1,5 @@
 # AccessStack
-[![Code Climate](https://codeclimate.com/github/fhsjaagshs/access_stack.png)](https://codeclimate.com/github/fhsjaagshs/access_stack)
+[![Build Status](https://travis-ci.org/fhsjaagshs/access_stack.png)](https://travis-ci.org/fhsjaagshs/access_stack) [![Code Climate](https://codeclimate.com/github/fhsjaagshs/access_stack.png)](https://codeclimate.com/github/fhsjaagshs/access_stack)
 
 A general-purpose object "pool" for storing general objects. It can be a connection pool, cache, or even just a factory.
 
