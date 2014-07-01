@@ -8,17 +8,20 @@ class AccessStack
 
 	TimeoutError = Class.new StandardError
 
-	def initialize(opts={})
-		@timeout = opts[:timeout] || opts["timeout"] || 5
-		@size = opts[:size] || opts["size"] || 5
-		@expires = opts[:expires] || opts["expires"] || -1
+	def initialize(params={})
+		opts = Hash[params.map { |k,v| [k.to_sym, v] }]
+		
+		@timeout = opts[:timeout] || 5
+		@size = opts[:size] || 5
+		@expires = opts[:expires] || -1
 		@expr_hash = {}
 		@stack = []
 		@count = 0
 		@mutex = Mutex.new
-		@create = opts[:create] || opts["create"]
-		@destroy = opts[:destroy] || opts["destroy"]
-		@validate = opts[:validate] || opts["validate"]
+		@create = opts[:create]
+		@destroy = opts[:destroy]
+		@validate = opts[:validate]
+		@auto_purge = opts[:auto_purge] || false
 	end
 
 	def with(&block)
@@ -29,7 +32,7 @@ class AccessStack
 				obj = @stack.pop
 			end
 		
-			if !(obj_valid obj)
+			unless obj_valid? obj
 				obj = nil
 				@count -= 1
 			end
@@ -50,16 +53,21 @@ class AccessStack
 	def reap!
 		return true if @count == 0
 		threadsafe do
-			@stack.reject(&method(:obj_valid)).each do |instance|
-				@destroy.call instance
-				@expr_hash.delete instance
-				@stack.delete instance
-				@count -= 1
+			@stack.each do |instance|
+				unless obj_valid? instance
+					@destroy.call instance
+					@expr_hash.delete instance
+					@stack.delete instance
+					@count -= 1
+					purging = false if @count == 0
+				end
 			end
 		end
 	end
 
 	def empty!
+		purging = false
+		
 		return if @count == 0
 		threadsafe do
 			@stack.each(&@destroy.method(:call))
@@ -82,6 +90,7 @@ class AccessStack
 					@stack.push create_obj
 					@count += 1
 					created_count += 1
+					purging = true
 				end
 			end
 		end
@@ -94,31 +103,58 @@ class AccessStack
 	end
 
 	private
-
-	def threadsafe(&block)
-		begin
-		  Timeout::timeout @timeout do
-		    @mutex.lock
-		  end
-		
-			block.call
-			@mutex.unlock
-			true
-		rescue Timeout::Error
-			raise TimeoutError, "Failed to obtain a lock fast enough."
-		end
-		false
-	end
-
+	
 	def create_obj
 		obj = @create.call
 		@expr_hash[obj] = Time.now
 		obj
 	end
 
-	def obj_valid(obj)
+	def obj_valid?(obj)
 		block_valid = @vaildate.call obj rescue true
 		expired = (@expires > 0 && @expr_hash[obj].to_f-Time.now.to_f > @expires)
 		!expired && block_valid
+	end
+
+	def threadsafe(&block)
+		
+		if @threadsafe ||= false
+			block.call
+			return true
+		end
+		
+		begin
+		  Timeout::timeout @timeout do
+		    @mutex.lock
+		  end
+			
+			@threadsafe = true
+		
+			block.call
+			@mutex.unlock
+			@threadsafe = false
+			return true
+		rescue Timeout::Error
+			raise TimeoutError, "Failed to obtain a lock fast enough."
+		end
+		false
+	end
+	
+	def purging=(purging)
+		@purging ||= false
+		return if @purging == purging
+		
+		threadsafe do
+			@purging = purging
+		end
+		
+		if @purging
+			Thread.new {
+			  while @purging do
+					sleep @expires
+					reap!
+			  end
+			}
+		end
 	end
 end
