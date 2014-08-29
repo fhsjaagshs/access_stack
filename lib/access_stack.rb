@@ -1,15 +1,16 @@
 require "access_stack/version"
 require "thread"
-require "timeout"
 
 class AccessStack
 	attr_reader :count
 	attr_accessor :expires, :size, :timeout, :create, :destroy, :validate
 
 	TimeoutError = Class.new StandardError
+  DestructorError = Class.new StandardError
+  CreatorError = Class.new StandardError
 
-	def initialize(params={})
-		opts = Hash[params.map { |k,v| [k.to_sym, v] }]
+	def initialize params={}
+    opts = params.inject({}) { |h,(k,v)| h[k.to_sym] = v; h }
 		
 		@timeout = opts[:timeout] || 5
 		@size = opts[:size] || 5
@@ -24,14 +25,11 @@ class AccessStack
 		@auto_purge = opts[:auto_purge] || false
 	end
 
-	def with(&block)
+	def with &block
 		begin
-			obj = nil
-		
-			threadsafe do
-				obj = @stack.pop
-			end
-		
+      obj = nil
+			threadsafe { obj = @stack.pop }
+
 			unless obj_valid? obj
 				obj = nil
 				@count -= 1
@@ -42,22 +40,21 @@ class AccessStack
 				obj = create_obj
 			end
 
-			return block.call obj
+			block.call obj
 		ensure
-			threadsafe do
-				@stack.push obj
-			end
+			threadsafe { @stack.push obj }
 		end
 	end
 	
 	def reap!
-		return true if @count == 0
+		return if @count == 0
+    raise DestructorError, "No :destroy block provided." if @destroy.nil?
 		threadsafe do
-			@stack.each do |instance|
-				unless obj_valid? instance
-					@destroy.call instance
-					@expr_hash.delete instance
-					@stack.delete instance
+			@stack.each do |inst|
+				unless obj_valid? inst
+					@destroy.call inst
+					@expr_hash.delete inst
+					@stack.delete inst
 					@count -= 1
 					purging = false if @count == 0
 				end
@@ -68,7 +65,7 @@ class AccessStack
 	def empty!
 		purging = false
 		
-		return if @count == 0
+		return if @count.zero?
 		threadsafe do
 			@stack.each(&@destroy.method(:call))
 			@expr_hash.clear
@@ -81,80 +78,76 @@ class AccessStack
 		create_objects @count
 	end
 
-	def create_objects(num=1)
-		created_count = 0
-	
+	def create_objects num=1
+		create_count = [@size-@count,num].min
+    return create_count if create_count.zero?
+    
 		threadsafe do
-			num.times do
-				if @count < @size
-					@stack.push create_obj
-					@count += 1
-					created_count += 1
-					purging = true
-				end
-			end
+			create_count.times { @stack.push create_obj }
+      purging = true
+      @count += create_count
 		end
 		
-		created_count
+		create_count
 	end
 
 	def empty?
-		@count == 0
+		@count.zero?
 	end
 
 	private
 	
 	def create_obj
+    raise CreatorError, "No :create block provided." if @destroy.nil?
 		obj = @create.call
 		@expr_hash[obj] = Time.now
 		obj
 	end
 
-	def obj_valid?(obj)
+	def obj_valid? obj
 		block_valid = @vaildate.call obj rescue true
 		expired = (@expires > 0 && @expr_hash[obj].to_f-Time.now.to_f > @expires)
 		!expired && block_valid
 	end
 
-	def threadsafe(&block)
-		
-		if @threadsafe ||= false
-			block.call
-			return true
-		end
-		
-		begin
-		  Timeout::timeout @timeout do
-		    @mutex.lock
-		  end
-			
-			@threadsafe = true
-		
-			block.call
-			@mutex.unlock
-			@threadsafe = false
-			return true
-		rescue Timeout::Error
-			raise TimeoutError, "Failed to obtain a lock fast enough."
-		end
-		false
+	def threadsafe &block
+    if @mutex.locked?
+      block.call
+      return
+    end
+    
+    begin
+      t = Thread.current
+      s = Thread.start do
+        sleep @timeout
+        t.raise TimeoutError, "Failed to obtain a lock fast enough."
+      end
+      
+      @mutex.lock
+    ensure
+      if s
+        s.kill
+        s.join
+      end
+    end
+    
+		block.call
+		@mutex.unlock
 	end
 	
-	def purging=(purging)
+	def purging= purging
 		@purging ||= false
 		return if @purging == purging
 		
-		threadsafe do
-			@purging = purging
-		end
-		
+		threadsafe { @purging = purging }
+
 		if @purging
-			Thread.new {
+			Thread.new do
 			  while @purging do
 					sleep @expires
 					reap!
 			  end
-			}
+      end
 		end
 	end
 end
