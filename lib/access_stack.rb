@@ -101,11 +101,16 @@ class AccessStack
 		end
 	end
 
+  # num - there are a few cases
+  #   negative - fill pool so that there are num.abs free spots for objects in the pool
+  #   positive - add num elements to the pool
+  #   not passed - fill the pool completely
 	def fill! num=@pool-@count
     raise CreatorError, "No :create block provided." if @create.nil?
     return 0 if full?
-    return 0 if num.zero?
-
+    num = @pool-num.abs if num < 0
+    return 0 if num <= 0
+    
 		threadsafe do
       num.times do
         obj = @create.call
@@ -120,8 +125,8 @@ class AccessStack
 		num
 	end
   
-  def start_purging! f=-1
-    threadsafe { @reaping_frequency = f unless f == -1 }
+  def start_purging! f=nil
+    threadsafe { @reaping_frequency = f unless f.nil? }
     return if @purging
     threadsafe { @purging = true }
 		Thread.new do
