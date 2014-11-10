@@ -1,70 +1,97 @@
-require "access_stack/version"
-require "thread"
+#!/usr/bin/env ruby
+
+require "threadsafety"
+require "timeout"
 
 class AccessStack
-	attr_reader :count
-	attr_accessor :expires, :size, :timeout, :create, :destroy, :validate
+  include Threadsafety # makes setters threadsafe + adds threadsafe method
+	attr_reader :count,
+              :create,
+              :destroy,
+              :validate
+  attr_accessor :pool,
+                :checkout_timeout,
+                :reaping_frequency,
+                :dead_connection_timeout
 
 	TimeoutError = Class.new StandardError
   DestructorError = Class.new StandardError
   CreatorError = Class.new StandardError
+  
+=begin
+  pool - size of pool (default 5)
+  checkout_timeout - number of seconds to wait when getting a connection from the pool
+  reaping_frequency - number of seconds to run the reaper (nil means don't run the reaper)
+  dead_connection_timeout - number of seconds after which the reaper will consider a connection dead. (default 5 seconds)
+=end
 
 	def initialize params={}
     opts = params.inject({}) { |h,(k,v)| h[k.to_sym] = v; h }
-		
-		@timeout = opts[:timeout] || 5
-		@size = opts[:size] || 5
-		@expires = opts[:expires] || -1
+    
+    @pool = opts[:pool] || 5
+    @checkout_timeout = opts[:checkout_timeout] || 5
+    @reaping_frequency = opts[:reaping_frequency] || nil
+    @dead_connection_timeout = opts[:dead_connection_timeout] || 5
+    
+    @purging = false
+		start_purging! unless @reaping_requency.nil?
+    
 		@expr_hash = {}
 		@stack = []
 		@count = 0
-		@mutex = Mutex.new
 		@create = opts[:create]
 		@destroy = opts[:destroy]
 		@validate = opts[:validate]
-		@auto_purge = opts[:auto_purge] || false
 	end
-
+  
+  # threadsafe setters
+  def create &block; threadsafe { @create = block }; end
+  def destroy &block; threadsafe { @destroy = block }; end
+  def validate &block; threadsafe { @validate = block }; end
+  
+	def empty?; @count.zero?; end
+  def full?; @count == @pool; end
+  def available?; !(full? && @stack.empty?); end
+  
 	def with &block
+    raise CreatorError, "No :create block provided." if @create.nil?
+    raise DestructorError, "No :destroy block provided." if @destroy.nil?
 		begin
-      obj = nil
-			threadsafe { obj = @stack.pop }
-
-			unless obj_valid? obj
-				obj = nil
-				@count -= 1
-			end
-		
-			if @count < @size && obj.nil?
-				@count += 1
-				obj = create_obj
-			end
+      obj = threadsafe { Timeout.timeout(@checkout_timeout, TimeoutError) { @stack.pop } }
+      
+      if !_obj_valid?(obj) && !obj.nil?
+        @destroy.call obj
+        @expr_hash.delete obj
+        @count -= 1
+        obj = nil
+      end
+      
+      obj = @create.call if obj.nil?
+      @expr_hash[obj] = Time.now
 
 			block.call obj
 		ensure
-			threadsafe { @stack.push obj }
+      threadsafe { @stack.push obj }
+      fill! if empty?
 		end
 	end
 	
 	def reap!
-		return if @count == 0
     raise DestructorError, "No :destroy block provided." if @destroy.nil?
+		return if empty?
 		threadsafe do
-			@stack.each do |inst|
-				unless obj_valid? inst
-					@destroy.call inst
-					@expr_hash.delete inst
-					@stack.delete inst
+			@stack.each do |obj|
+				unless _obj_valid? obj
+					@destroy.call obj
+					@expr_hash.delete obj
+					@stack.delete obj
 					@count -= 1
-					purging = false if @count == 0
 				end
 			end
 		end
 	end
 
-	def empty!
-		purging = false
-		
+	def clear!
 		return if @count.zero?
 		threadsafe do
 			@stack.each(&@destroy.method(:call))
@@ -74,80 +101,48 @@ class AccessStack
 		end
 	end
 
-	def fill
-		create_objects @count
-	end
+	def fill! num=@pool-@count
+    raise CreatorError, "No :create block provided." if @create.nil?
+    return 0 if full?
+    return 0 if num.zero?
 
-	def create_objects num=1
-		create_count = [@size-@count,num].min
-    return create_count if create_count.zero?
-    
 		threadsafe do
-			create_count.times { @stack.push create_obj }
-      purging = true
-      @count += create_count
+      num.times do
+        obj = @create.call
+        @expr_hash[obj] = Time.now
+        @stack.push obj
+      end
+      @count += num
 		end
+    
+    start_purging!
 		
-		create_count
+		num
 	end
+  
+  def start_purging! f=-1
+    threadsafe { @reaping_frequency = f unless f == -1 }
+    return if @purging
+    threadsafe { @purging = true }
+		Thread.new do
+		  while !@reaping_requency.nil? && !@reaping_requency.zero? && @purging && !empty? do
+				sleep @reaping_frequency
+				reap!
+		  end
+    end
+  end
 
-	def empty?
-		@count.zero?
-	end
+  def stop_purging!
+    return unless @purging
+    threadsafe { @purging = false }
+  end
 
 	private
-	
-	def create_obj
-    raise CreatorError, "No :create block provided." if @destroy.nil?
-		obj = @create.call
-		@expr_hash[obj] = Time.now
-		obj
-	end
 
-	def obj_valid? obj
-		block_valid = @vaildate.call obj rescue true
-		expired = (@expires > 0 && @expr_hash[obj].to_f-Time.now.to_f > @expires)
+	def _obj_valid? obj
+    return false if obj.nil?
+		block_valid = true#@validate.nil? ? true : @vaildate.call(obj)
+		expired = (@dead_connection_timeout > 0 && (@expr_hash[obj]-Time.now).to_f > @dead_connection_timeout)
 		!expired && block_valid
-	end
-
-	def threadsafe &block
-    if @mutex.locked?
-      block.call
-      return
-    end
-    
-    begin
-      t = Thread.current
-      s = Thread.start do
-        sleep @timeout
-        t.raise TimeoutError, "Failed to obtain a lock fast enough."
-      end
-      
-      @mutex.lock
-    ensure
-      if s
-        s.kill
-        s.join
-      end
-    end
-    
-		block.call
-		@mutex.unlock
-	end
-	
-	def purging= purging
-		@purging ||= false
-		return if @purging == purging
-		
-		threadsafe { @purging = purging }
-
-		if @purging
-			Thread.new do
-			  while @purging do
-					sleep @expires
-					reap!
-			  end
-      end
-		end
 	end
 end
