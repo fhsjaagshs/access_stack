@@ -3,6 +3,8 @@
 require "rspec"
 require_relative "../lib/access_stack.rb"
 
+CONCURRENCY = 5
+
 describe AccessStack do
   before :each do
     @s = AccessStack.new
@@ -14,30 +16,30 @@ describe AccessStack do
 	it "should create objects" do
 		res = @s.with { |inst| inst + "FOOBAR" } 
 		@s.clear!
-		res == "THISFOOBAR"
+    @s.fill!
+    expect(res).to eq("THISFOOBAR")
+    expect(@s.full?).to be_truthy
 	end
 	
 	it "should work concurrently" do
-		@s.fill! 1
+		@s.fill!
 		
-		begin
-     # values = []
-			t = []
-			t << Thread.new { @s.with { |inst| inst + "ONE" } }
-			t << Thread.new { @s.with { |inst| inst + "TWO" } }
-			t << Thread.new { @s.with { |inst| inst + "THREE" } }
-			t.each(&:join)
-    #  @s.count == 3# && values == ["THISONE","THISTWO","THISTHREE"]
-		rescue StandardError => e
-			puts e.message
-			false
-		end
-		
-		@s.count == 3
+    threads = []
+    objs = []
+    
+    CONCURRENCY.times do |i|
+      threads << Thread.new { @s.with { |obj| objs << obj } }
+    end
+    
+    expect { threads.each(&:join) }.not_to raise_error
+    expect(@s.count).to eql(CONCURRENCY)
+    expect(objs.count).to eql(CONCURRENCY)
 	end
 	
-	it "should be able to time out" do
-		@s.dead_connection_timeout = 0.0000000000000001
-		@s.with { |inst| inst + "FOOBAR" } != nil rescue AccessStack::TimeoutError false
-	end
+  # TODO: This needs a lot of work
+	#it "should be able to time out" do
+  #  @s.checkout_timeout = 10 ** -1000
+  #  puts @s.instance_variable_get "@checkout_timeout"
+  #  expect { @s.with { |obj| obj + "FOOBAR" } }.to raise_error#(AccessStack::TimeoutError)
+	#end
 end

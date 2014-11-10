@@ -56,16 +56,17 @@ class AccessStack
 	def with &block
     raise CreatorError, "No :create block provided." if @create.nil?
     raise DestructorError, "No :destroy block provided." if @destroy.nil?
+    
 		begin
-      obj = threadsafe { Timeout.timeout(@checkout_timeout, TimeoutError) { @stack.pop } }
-      
+      obj = Timeout.timeout(@checkout_timeout, TimeoutError) { threadsafe { @stack.pop } }
+    
       if !_obj_valid?(obj) && !obj.nil?
         @destroy.call obj
         @expr_hash.delete obj
         @count -= 1
         obj = nil
       end
-      
+    
       obj = @create.call if obj.nil?
       @expr_hash[obj] = Time.now
 
