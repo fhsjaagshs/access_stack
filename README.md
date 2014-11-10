@@ -3,11 +3,9 @@
 
 A general-purpose object "pool" for storing general objects. It can be a connection pool, cache, or even just a factory.
 
-## Notes
+It takes the same parameters as ActiveRecord's connection pool and was built specifically for the gem `Mystic` (it's `Mystic`'s connection pool)
 
-AccessStack is *very* threadsafe. It uses an internal stack to store the objects and any interaction with that is done with a `Mutex` lock in place.
-
-AccessStack also implements most of the features present in ActiveRecord's connection pool, such as reaping, expiration, and timeout. It takes it a step farther by 
+AccessStack is ***threadsafe***, obviously. It uses the `threadsafety` gem.
 
 ## Installation
 
@@ -30,25 +28,34 @@ You can create a stack:
 	require "access_stack"
 
 	s = AccessStack.new(
-	  :size => 10,
-	  :timeout => 3, # how long to wait for access to the stack
-	  :expires => 5, # how long an object lasts in the stack
-	  :create => lambda {
-	    PG.connect
-	  },
-	  :destroy => lambda { |instance|
-	    instance.close
-	  },
-	  :validate => lamda { |instance|
-	    instance.status == CONNECTION_OK
-	  }
-	)
+		:pool => 3, # size of pool (default 5)
+		:checkout_timeout => 10, # Timeout in seconds for checking a connection out of the pool (default 5)
+		:reaping_frequency => 5, # How often to run the reaper, in seconds (Default nil - don't run the reaper)
+		:dead_connection_timeout # How long in seconds a connection is considered alive (default 5)
+	  	:create => lambda {
+	   	  PG.connect
+	 	},
+	    :destroy => lambda { |instance|
+	      instance.close
+	    },
+	    :validate => lamda { |instance|
+	      instance.status == CONNECTION_OK
+	    }
+	  )
 	
 Set a stack's blocks:
 
-	s.create = lambda {
-	  # Do something
-	}
+	s.create do
+	  # do something
+	end
+	
+	s.destroy do |inst|
+	  # do something with inst
+	end
+	
+	s.validate do |inst|
+	  # return whether or not inst is valid
+	end
 	
 Use an instance:
 
@@ -57,20 +64,17 @@ Use an instance:
 	
 Eager-load instances:
 	
-	s.create_objects 5 # Create and add 5 objects to the stack
-	s.fill # Fill the stack to capacity
+	s.fill! 5 # Add 5 objects to the stack
+	s.fill! -1 # Fill stack to capacity-1
+	s.fill! # Fill stack to capacity
 	
 Clear out instances:
 
 	s.reap! # Validates each object using expires and validate
-	s.empty! # Empties the stack
+	s.clear! # Empties the stack
 	s.empty? # Checks if the stack is empty
-
-
-## TODO
-
-1. Validate based upon methods on objects in the pool
-2. Reap on an interval
+	s.available? # Whether or not the pool is full
+	s.full? # Whether or not the stack is full
 
 ## Contributing
 
