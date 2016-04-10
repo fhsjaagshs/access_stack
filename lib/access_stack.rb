@@ -18,6 +18,9 @@ class AccessStack
   DestructorError = Class.new StandardError
   CreatorError = Class.new StandardError
   
+  NO_DESTRUCTOR_MSG = "This pool is lacking a constructor block."
+  NO_CONSTRUCTOR_MSG = "This pool is lacking a destructor block."
+  
 =begin
   pool - size of pool (default 5)
   checkout_timeout - number of seconds to wait when getting a connection from the pool
@@ -30,11 +33,8 @@ class AccessStack
     
     @pool = opts[:pool] || 5
     @checkout_timeout = opts[:checkout_timeout] || 5
-    @reaping_frequency = opts[:reaping_frequency] || nil
+    reaping_frequency = opts[:reaping_frequency] || 0 # setter starts autoreaping
     @dead_connection_timeout = opts[:dead_connection_timeout] || 5
-    
-    @purging = false
-		start_purging! unless @reaping_requency.nil?
     
 		@expr_hash = {}
 		@stack = []
@@ -44,61 +44,63 @@ class AccessStack
 		@validate = opts[:validate]
 	end
   
-  # threadsafe setters
+  # contructor/destructor/validator blocks
   def create &block; threadsafe { @create = block }; end
   def destroy &block; threadsafe { @destroy = block }; end
   def validate &block; threadsafe { @validate = block }; end
   
 	def empty?; @count.zero?; end
   def full?; @count == @pool; end
-  def available?; !(full? && @stack.empty?); end
+  def available?; @stack.count > 0 && !empty?; end # whether or not you can get an object from the pool
+  def autoreaping?; @reaping_frequency > 0; end
   
-	def with &block
-    raise CreatorError, "No :create block provided." if @create.nil?
-    raise DestructorError, "No :destroy block provided." if @destroy.nil?
+  def reaping_frequency= v
+    threadsafe { @reaping_frequency = v }
+    start_autoreap if autoreaping?
+  end
+  
+  def delete obj
+    return obj if obj.nil?
+    threadsafe do
+      @count -= 1 if @stack.include? obj
+  		@destroy.call(@stack.delete(@expr_hash.delete(obj)) || obj)
+    end
+    obj
+  end
+  
+	def with
+    raise CreatorError, NO_CONSTRUCTOR_MSG if @create.nil?
+    raise DestructorError, NO_DESTRUCTOR_MSG if @destroy.nil?
     
 		begin
-      obj = Timeout.timeout(@checkout_timeout, TimeoutError) { threadsafe { @stack.pop } }
+      obj = @create.call if @stack.empty? # create one if needed
+      obj ||= Timeout.timeout(@checkout_timeout, TimeoutError) { threadsafe { @stack.pop } } # otherwise load from @stack
     
-      if !_obj_valid?(obj) && !obj.nil?
-        @destroy.call obj
-        @expr_hash.delete obj
-        @count -= 1
-        obj = nil
+      if !_obj_valid?(obj)
+        delete obj
+        obj = @create.call
       end
     
-      obj = @create.call if obj.nil?
-      @expr_hash[obj] = Time.now
+      threadsafe { @expr_hash[obj] = Time.now }
 
-			block.call obj
+			yield obj
 		ensure
-      threadsafe { @stack.push obj }
-      fill! if empty?
+      threadsafe { @stack.push obj } unless obj.nil?
 		end
 	end
 	
 	def reap!
-    raise DestructorError, "No :destroy block provided." if @destroy.nil?
+    raise DestructorError, NO_DESTRUCTOR_MSG if @destroy.nil?
 		return if empty?
-		threadsafe do
-			@stack.each do |obj|
-				unless _obj_valid? obj
-					@destroy.call obj
-					@expr_hash.delete obj
-					@stack.delete obj
-					@count -= 1
-				end
-			end
-		end
+    threadsafe { @stack.reject(&method(:_obj_valid?)).each(&method(:delete)) }
 	end
 
 	def clear!
-		return if @count.zero?
 		threadsafe do
+      @count = 0
+      @expr_hash.clear
 			@stack.each(&@destroy.method(:call))
-			@expr_hash.clear
 			@stack.clear
-			@count = 0
 		end
 	end
 
@@ -107,48 +109,41 @@ class AccessStack
   #   positive - add num elements to the pool
   #   not passed - fill the pool completely
 	def fill! num=@pool-@count
-    raise CreatorError, "No :create block provided." if @create.nil?
+    raise CreatorError, NO_CONSTRUCTOR_MSG if @create.nil?
+    
     return 0 if full?
     num = @pool-num.abs if num < 0
     return 0 if num <= 0
     
-		threadsafe do
-      num.times do
-        obj = @create.call
-        @expr_hash[obj] = Time.now
-        @stack.push obj
-      end
+    objs = num.times.map(&@create.method(:call))
+    expr_addition = objs.zip([Time.now]*num)
+    
+    threadsafe do
+      @expr_hash.merge(expr_addition)
+      @stack.push *objs
       @count += num
-		end
+    end
     
     start_purging!
 		
 		num
 	end
-  
-  def start_purging! f=nil
-    threadsafe { @reaping_frequency = f unless f.nil? }
-    return if @purging
-    threadsafe { @purging = true }
-		Thread.new do
-		  while !@reaping_requency.nil? && !@reaping_requency.zero? && @purging && !empty? do
-				sleep @reaping_frequency
-				reap!
-		  end
-    end
-  end
-
-  def stop_purging!
-    return unless @purging
-    threadsafe { @purging = false }
-  end
 
 	private
 
+  def start_autoreap
+    Thread.new do
+      while autoreaping?
+				sleep @reaping_frequency
+				reap!
+      end
+    end
+  end
+
 	def _obj_valid? obj
     return false if obj.nil?
-		block_valid = true#@validate.nil? ? true : @vaildate.call(obj)
+	  valid = obj.respond_to?(:valid?) ? obj.valid? : (@validate.nil? ? true : @vaildate.call(obj))
 		expired = (@dead_connection_timeout > 0 && (@expr_hash[obj]-Time.now).to_f > @dead_connection_timeout)
-		!expired && block_valid
+		!expired && valid
 	end
 end
